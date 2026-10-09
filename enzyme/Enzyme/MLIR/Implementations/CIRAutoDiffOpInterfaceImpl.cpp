@@ -97,11 +97,11 @@ public:
       result = cir::InsertMemberOp::create(b, loc, result, i, v);
     return cir::ReturnOp::create(b, loc, ValueRange{result});
   }
-
-  bool isReturn(Operation *, Operation *op) const {
-    return isa<cir::ReturnOp>(op);
-  }
 };
+
+struct CIRReturnOpFunctionReturnInterface
+    : public FunctionReturnOpInterface::ExternalModel<
+          CIRReturnOpFunctionReturnInterface, cir::ReturnOp> {};
 
 void mlir::enzyme::registerCIRDialectAutoDiffInterface(
     DialectRegistry &registry) {
@@ -110,5 +110,7 @@ void mlir::enzyme::registerCIRDialectAutoDiffInterface(
     registerInterfaces(context);
     registerCIRAutoDiffTypeInterfaces(context);
     cir::FuncOp::attachInterface<AutoDiffCIRFuncOpFunctionInterface>(*context);
+    cir::ReturnOp::attachInterface<CIRReturnOpFunctionReturnInterface>(
+        *context);
   });
 }
