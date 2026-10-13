@@ -934,8 +934,7 @@ bool mlir::enzyme::ActivityAnalyzer::isConstantOperation(MTypeResults const &TR,
     // Even if returning a pointer, this instruction is considered inactive
     // since the instruction doesn't prop gradients. Thus, so long as we don't
     // return an object containing a float, this instruction is inactive
-    if (I->getNumResults() != 0 &&
-        llvm::all_of(I->getResults(), [&](Value v) {
+    if (I->getNumResults() != 0 && llvm::all_of(I->getResults(), [&](Value v) {
           return !TR.intType(1, v, /*errIfNotFound*/ false).isPossibleFloat();
         })) {
       if (EnzymePrintActivity)

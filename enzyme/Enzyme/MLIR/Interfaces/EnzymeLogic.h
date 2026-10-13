@@ -4,12 +4,11 @@
 #include "mlir/IR/IRMapping.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
 
-
+#include "../../Utils.h"
+#include <functional>
 #include <map>
 #include <string>
 #include <vector>
-#include "../../Utils.h"
-#include <functional>
 
 namespace mlir {
 namespace enzyme {
