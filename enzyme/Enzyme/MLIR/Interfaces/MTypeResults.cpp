@@ -46,6 +46,9 @@ std::string MConcreteType::str() const {
 }
 
 void MTypeTree::insert(const std::vector<int> &seq, MConcreteType ct) {
+  assert((seq.size() <= 1 ||
+          mapping.count(std::vector<int>(seq.begin(), seq.end() - 1))) &&
+         "MTypeTree::insert: the enclosing prefix must be inserted first");
   mapping.insert_or_assign(seq, ct);
 }
 
@@ -158,7 +161,8 @@ MConcreteType MTypeResults::intType(size_t num, Value val, bool errIfNotFound,
   }
 #endif
   if (errIfNotFound)
-    llvm_unreachable("something happened");
+    llvm_unreachable("MTypeResults::intType: could not deduce the type of the "
+                     "value from its MLIR type");
   return MBaseType::Unknown;
 }
 
@@ -178,6 +182,7 @@ MConcreteType MTypeResults::firstPointer(size_t num, Value val,
   }
 #endif
   if (errIfNotFound)
-    llvm_unreachable("something happened");
+    llvm_unreachable("MTypeResults::firstPointer: could not deduce the pointee "
+                     "type of the value from its MLIR type");
   return MBaseType::Unknown;
 }
