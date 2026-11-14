@@ -41,12 +41,12 @@ module {
 // CHECK-NEXT:    cf.br ^bb3
 // CHECK-NEXT:  ^bb3:  // 2 preds: ^bb2, ^bb3
 // CHECK-NEXT:    %8 = "enzyme.pop"(%1) : (!enzyme.Cache<i32>) -> i32
-// CHECK-NEXT:    %9 = arith.cmpi eq, %8, %c-1_i32 : i32
-// CHECK-NEXT:    %10 = arith.select %9, %7, %cst_0 : f64
+// CHECK-NEXT:    %[[CMP:.+]] = arith.cmpi eq, %8, %c0_i32 : i32
+// CHECK-NEXT:    %[[GRAD:.+]] = arith.select %[[CMP]], %7, %cst_0 : f64
 // CHECK-NEXT:    cf.switch %8 : i32, [
 // CHECK-NEXT:      default: ^bb3,
 // CHECK-NEXT:      0: ^bb4
 // CHECK-NEXT:    ]
 // CHECK-NEXT:  ^bb4:  // pred: ^bb3
-// CHECK-NEXT:    return %10 : f64
+// CHECK-NEXT:    return %[[GRAD]] : f64
 // CHECK-NEXT:  }
