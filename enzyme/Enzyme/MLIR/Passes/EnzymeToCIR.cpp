@@ -343,7 +343,6 @@ public:
   static constexpr uint64_t kInlineCapacity = 8;
 
 private:
-
   cir::FuncOp buildFunctionInModule(Location loc, StringRef name,
                                     cir::FuncType type) {
     OpBuilder b(module.getContext());
