@@ -54,6 +54,25 @@ using namespace mlir;
 class MemRefInsider
     : public mlir::MemRefElementTypeInterface::FallbackModel<MemRefInsider> {};
 
+#ifdef ENZYME_CLANG_HAS_CIR
+struct CIRAutoDiffPipelineOptions
+    : public PassPipelineOptions<CIRAutoDiffPipelineOptions> {
+  Option<bool> runtimeActivity{
+      *this, "runtimeActivity",
+      llvm::cl::desc("Differentiate with the enzyme pass's runtimeActivity"),
+      llvm::cl::init(false)};
+  Option<bool> optimizeCaches{
+      *this, "optimizeCaches",
+      llvm::cl::desc("Differentiate with the enzyme pass's optimizeCaches"),
+      llvm::cl::init(false)};
+  Option<bool> inlineCalls{
+      *this, "inline",
+      llvm::cl::desc(
+          "Inline calls, and clean up after, before differentiating"),
+      llvm::cl::init(false)};
+};
+#endif
+
 template <typename T>
 struct PtrElementModel
     : public mlir::LLVM::PointerElementTypeInterface::ExternalModel<
@@ -95,17 +114,25 @@ int main(int argc, char **argv) {
   // The calls are raised first, so that canonicalize sees the enzyme ops and
   // drops the results the program never uses. The gradients are not promoted
   // after differentiating: that can give a cir.switch.flat successor operands,
-  // which cir-translate cannot lower yet.
-  mlir::PassPipelineRegistration<>(
+  // which cir-translate cannot lower yet. With inline, what the raised calls
+  // differentiate gets its helpers inlined into it first, as LLVM Enzyme
+  // differentiates after -O2.
+  mlir::PassPipelineRegistration<CIRAutoDiffPipelineOptions>(
       "cir-autodiff-pipeline",
       "Differentiate the __enzyme_* calls of a ClangIR module and lower the "
       "result back to ClangIR",
-      [](OpPassManager &pm) {
+      [](OpPassManager &pm, const CIRAutoDiffPipelineOptions &options) {
         std::string error;
         llvm::raw_string_ostream os(error);
         if (failed(parsePassPipeline(
-                "cir-flatten-cfg,cir-raise-enzyme-calls,mem2reg,canonicalize,"
-                "enzyme,canonicalize,convert-enzyme-to-cir",
+                (llvm::Twine("cir-flatten-cfg,cir-raise-enzyme-calls,") +
+                 (options.inlineCalls ? "enzyme-inline-callees,cse," : "") +
+                 "mem2reg,canonicalize,enzyme{runtimeActivity=" +
+                 (options.runtimeActivity ? "true" : "false") +
+                 " optimizeCaches=" +
+                 (options.optimizeCaches ? "true" : "false") +
+                 "},canonicalize,convert-enzyme-to-cir")
+                    .str(),
                 pm, os)))
           llvm::report_fatal_error(llvm::Twine(error));
       });
