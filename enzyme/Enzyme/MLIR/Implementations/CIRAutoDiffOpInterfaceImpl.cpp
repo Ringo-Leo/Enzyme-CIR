@@ -595,7 +595,9 @@ static bool copiesOnlyFloatFreeData(Type t) {
   return succeeded(f) && !*f;
 }
 
-static Type memcpyCopiedType(cir::MemCpyOp memcpy) {
+// What a cir.libc.memcpy or cir.libc.memmove copies, as one of its pointers
+// says before it is cast to void.
+template <typename OpTy> static Type memcpyCopiedType(OpTy memcpy) {
   for (Value ptr : {memcpy.getDst(), memcpy.getSrc()}) {
     if (auto castOp = ptr.getDefiningOp<cir::CastOp>();
         castOp && castOp.getKind() == cir::CastKind::bitcast)
@@ -607,7 +609,7 @@ static Type memcpyCopiedType(cir::MemCpyOp memcpy) {
   return Type();
 }
 
-static FailureOr<Type> memcpyFloatType(cir::MemCpyOp memcpy) {
+template <typename OpTy> static FailureOr<Type> memcpyFloatType(OpTy memcpy) {
   Type copied = memcpyCopiedType(memcpy);
   if (!copied)
     return failure();
@@ -634,16 +636,16 @@ static void accumulateAndZero(OpBuilder &builder, Location loc, Type floatTy,
     return cir::ConstantOp::create(
         b, loc, lenTy, cir::IntAttr::get(lenTy, APInt(lenTy.getWidth(), v)));
   };
-  DataLayout layout =
-      DataLayout::closest(dstShadow.getParentBlock()->getParentOp());
+  // The builder may be filling a region whose op is not built yet; the
+  // source's shadow is defined in the function already. The destination's
+  // can be a buffer made here, as a memmove's is.
+  Operation *fn = srcShadow.getParentBlock()->getParentOp();
+  if (!isa<FunctionOpInterface>(fn))
+    fn = fn->getParentOfType<FunctionOpInterface>();
+  DataLayout layout = DataLayout::closest(fn);
   Value count = cir::DivOp::create(
       builder, loc, len, constLen(builder, layout.getTypeSize(floatTy)));
 
-  // The builder may be filling a region whose op is not built yet; the
-  // shadow is defined in the function already.
-  Operation *fn = dstShadow.getParentBlock()->getParentOp();
-  if (!isa<FunctionOpInterface>(fn))
-    fn = fn->getParentOfType<FunctionOpInterface>();
   OpBuilder entryBuilder = OpBuilder::atBlockBegin(&fn->getRegion(0).front());
   Value iv = cir::AllocaOp::create(
       entryBuilder, loc, cir::PointerType::get(lenTy), "memcpy.idx",
@@ -792,18 +794,55 @@ struct CIRCopyOpReverse
   }
 };
 
-struct CIRMemCpyOpForward
-    : public AutoDiffOpInterface::ExternalModel<CIRMemCpyOpForward,
-                                                cir::MemCpyOp> {
+static cir::FuncOp getMallocFunction(Operation *from);
+static cir::FuncOp getFreeFunction(Operation *from);
+
+// dsrc += ddst; ddst = 0, the adjoint of a copy of floatTy elements in len
+// bytes. A memmove's ranges can overlap, so its destination's adjoint is moved
+// aside, then zeroed, then added to the source's.
+template <typename OpTy>
+static void transferAdjoint(OpBuilder &builder, Location loc, Type floatTy,
+                            Value dstShadow, Value srcShadow, Value len) {
+  if constexpr (!std::is_same_v<OpTy, cir::MemMoveOp>) {
+    accumulateAndZero(builder, loc, floatTy, dstShadow, srcShadow, len);
+  } else {
+    Operation *fn = srcShadow.getParentBlock()->getParentOp();
+    if (!isa<FunctionOpInterface>(fn))
+      fn = fn->getParentOfType<FunctionOpInterface>();
+    MLIRContext *ctx = builder.getContext();
+    auto u64 = cir::IntType::get(ctx, 64, /*isSigned=*/false);
+    Value bytes = len.getType() == u64
+                      ? len
+                      : cir::CastOp::create(builder, loc, u64,
+                                            cir::CastKind::integral, len)
+                            .getResult();
+    Value saved =
+        cir::CallOp::create(
+            builder, loc, SymbolRefAttr::get(getMallocFunction(fn)),
+            cir::PointerType::get(cir::VoidType::get(ctx)), ValueRange{bytes})
+            .getResult();
+    cir::MemCpyOp::create(builder, loc, saved, dstShadow, len,
+                          /*dst_alignment=*/nullptr, /*src_alignment=*/nullptr);
+    zeroBytes(builder, loc, dstShadow, len);
+    accumulateAndZero(builder, loc, floatTy, saved, srcShadow, len);
+    cir::CallOp::create(builder, loc, SymbolRefAttr::get(getFreeFunction(fn)),
+                        Type(), ValueRange{saved});
+  }
+}
+
+template <typename OpTy>
+struct CIRMemTransferOpForward
+    : public AutoDiffOpInterface::ExternalModel<CIRMemTransferOpForward<OpTy>,
+                                                OpTy> {
   LogicalResult createForwardModeTangent(Operation *op, OpBuilder &builder,
                                          MGradientUtils *gutils) const {
-    auto memcpy = cast<cir::MemCpyOp>(op);
+    auto memcpy = cast<OpTy>(op);
     if (gutils->isConstantValue(memcpy.getDst()))
       return success();
     Value dstShadow = gutils->invertPointerM(memcpy.getDst(), builder);
-    auto newOp = cast<cir::MemCpyOp>(gutils->getNewFromOriginal(op));
+    auto newOp = cast<OpTy>(gutils->getNewFromOriginal(op));
     if (!gutils->isConstantValue(memcpy.getSrc())) {
-      auto shadowOp = cast<cir::MemCpyOp>(builder.clone(*newOp));
+      auto shadowOp = cast<OpTy>(builder.clone(*newOp));
       shadowOp.getDstMutable().assign(dstShadow);
       shadowOp.getSrcMutable().assign(
           gutils->invertPointerM(memcpy.getSrc(), builder));
@@ -817,7 +856,7 @@ struct CIRMemCpyOpForward
       if (*floatTy) {
         zeroBytes(builder, op->getLoc(), dstShadow, newOp.getLen());
       } else {
-        auto shadowOp = cast<cir::MemCpyOp>(builder.clone(*newOp));
+        auto shadowOp = cast<OpTy>(builder.clone(*newOp));
         shadowOp.getDstMutable().assign(dstShadow);
       }
     }
@@ -827,13 +866,14 @@ struct CIRMemCpyOpForward
   }
 };
 
-struct CIRMemCpyOpReverse
-    : public ReverseAutoDiffOpInterface::ExternalModel<CIRMemCpyOpReverse,
-                                                       cir::MemCpyOp> {
+template <typename OpTy>
+struct CIRMemTransferOpReverse
+    : public ReverseAutoDiffOpInterface::ExternalModel<
+          CIRMemTransferOpReverse<OpTy>, OpTy> {
   LogicalResult createReverseModeAdjoint(Operation *op, OpBuilder &builder,
                                          MGradientUtilsReverse *gutils,
                                          SmallVector<Value> caches) const {
-    auto memcpy = cast<cir::MemCpyOp>(op);
+    auto memcpy = cast<OpTy>(op);
     if (gutils->isConstantValue(memcpy.getDst()))
       return success();
     FailureOr<Type> floatTy = memcpyFloatType(memcpy);
@@ -864,7 +904,7 @@ struct CIRMemCpyOpReverse
           return;
         }
         if (!srcSame) {
-          accumulateAndZero(b, loc, *floatTy, dstShadow, srcShadow, len);
+          transferAdjoint<OpTy>(b, loc, *floatTy, dstShadow, srcShadow, len);
           return;
         }
         cir::IfOp::create(
@@ -874,7 +914,7 @@ struct CIRMemCpyOpReverse
               cir::YieldOp::create(tb, l);
             },
             [&](OpBuilder &eb, Location l) {
-              accumulateAndZero(eb, l, *floatTy, dstShadow, srcShadow, len);
+              transferAdjoint<OpTy>(eb, l, *floatTy, dstShadow, srcShadow, len);
               cir::YieldOp::create(eb, l);
             });
       };
@@ -896,7 +936,7 @@ struct CIRMemCpyOpReverse
 
   SmallVector<Value> cacheValues(Operation *op,
                                  MGradientUtilsReverse *gutils) const {
-    auto memcpy = cast<cir::MemCpyOp>(op);
+    auto memcpy = cast<OpTy>(op);
     if (gutils->isConstantValue(memcpy.getDst()))
       return {};
     FailureOr<Type> floatTy = memcpyFloatType(memcpy);
@@ -920,20 +960,20 @@ struct CIRMemCpyOpReverse
 
   LogicalResult createShadowValues(Operation *op, OpBuilder &builder,
                                    MGradientUtilsReverse *gutils) const {
-    auto memcpy = cast<cir::MemCpyOp>(op);
+    auto memcpy = cast<OpTy>(op);
     if (gutils->isConstantValue(memcpy.getDst()))
       return success();
     // Float shadows hold adjoint seeds now; leave them for the reverse sweep.
     FailureOr<Type> floatTy = memcpyFloatType(memcpy);
     if (failed(floatTy) || *floatTy)
       return success();
-    auto newOp = cast<cir::MemCpyOp>(gutils->getNewFromOriginal(op));
+    auto newOp = cast<OpTy>(gutils->getNewFromOriginal(op));
     Value dstShadow = gutils->invertPointerM(memcpy.getDst(), builder);
     Value srcShadow = gutils->isConstantValue(memcpy.getSrc())
                           ? Value()
                           : gutils->invertPointerM(memcpy.getSrc(), builder);
     auto copyShadows = [&](OpBuilder &b) {
-      auto shadowOp = cast<cir::MemCpyOp>(b.clone(*newOp));
+      auto shadowOp = cast<OpTy>(b.clone(*newOp));
       shadowOp.getDstMutable().assign(dstShadow);
       if (srcShadow)
         shadowOp.getSrcMutable().assign(srcShadow);
@@ -1866,8 +1906,14 @@ void mlir::enzyme::registerCIRDialectAutoDiffInterface(
     cir::CopyOp::attachInterface<CIRMemTransfer<cir::CopyOp>>(*context);
     cir::MemCpyOp::attachInterface<CIRMemTransfer<cir::MemCpyOp>>(*context);
     cir::MemMoveOp::attachInterface<CIRMemTransfer<cir::MemMoveOp>>(*context);
-    cir::MemCpyOp::attachInterface<CIRMemCpyOpForward>(*context);
-    cir::MemCpyOp::attachInterface<CIRMemCpyOpReverse>(*context);
+    cir::MemCpyOp::attachInterface<CIRMemTransferOpForward<cir::MemCpyOp>>(
+        *context);
+    cir::MemCpyOp::attachInterface<CIRMemTransferOpReverse<cir::MemCpyOp>>(
+        *context);
+    cir::MemMoveOp::attachInterface<CIRMemTransferOpForward<cir::MemMoveOp>>(
+        *context);
+    cir::MemMoveOp::attachInterface<CIRMemTransferOpReverse<cir::MemMoveOp>>(
+        *context);
     cir::GetGlobalOp::attachInterface<CIRGetGlobalOpForward>(*context);
     cir::GetGlobalOp::attachInterface<CIRGetGlobalOpReverse>(*context);
     cir::LifetimeStartOp::attachInterface<

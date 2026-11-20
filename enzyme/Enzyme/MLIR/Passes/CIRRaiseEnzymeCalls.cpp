@@ -389,6 +389,37 @@ LogicalResult raiseCall(cir::CallOp call, bool forward,
   return success();
 }
 
+// ClangIR emits memmove, as __builtin_memmove, as a call to the C library,
+// which has no body to differentiate. cir.libc.memmove is the same copy, and
+// has a derivative; the call's result is its destination.
+void raiseMemmoves(ModuleOp module) {
+  SmallVector<cir::CallOp> calls;
+  module.walk([&](cir::CallOp call) {
+    std::optional<StringRef> callee = call.getCallee();
+    if (!callee || *callee != "memmove" || call.getArgOperands().size() != 3)
+      return;
+    auto fn = SymbolTable::lookupNearestSymbolFrom<cir::FuncOp>(
+        call, call.getCalleeAttr());
+    if (!fn || !fn.isDeclaration())
+      return;
+    OperandRange args = call.getArgOperands();
+    auto voidPtr = cir::PointerType::get(cir::VoidType::get(call.getContext()));
+    auto len = dyn_cast<cir::IntType>(args[2].getType());
+    if (args[0].getType() != voidPtr || args[1].getType() != voidPtr || !len ||
+        !len.isUnsigned())
+      return;
+    calls.push_back(call);
+  });
+  for (cir::CallOp call : calls) {
+    OpBuilder b(call);
+    OperandRange args = call.getArgOperands();
+    cir::MemMoveOp::create(b, call.getLoc(), args[0], args[1], args[2]);
+    if (call.getNumResults())
+      call.getResult().replaceAllUsesWith(args[0]);
+    call.erase();
+  }
+}
+
 #endif // ENZYME_CLANG_HAS_CIR
 
 struct CIRRaiseEnzymeCallsPass
@@ -402,6 +433,7 @@ struct CIRRaiseEnzymeCallsPass
     signalPassFailure();
 #else
     ModuleOp module = getOperation();
+    raiseMemmoves(module);
     SymbolTableCollection symbols;
     SmallVector<std::pair<cir::CallOp, bool>> calls;
     module.walk([&](cir::CallOp call) {

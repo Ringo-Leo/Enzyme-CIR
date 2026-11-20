@@ -371,6 +371,8 @@ def CIRRaiseEnzymeCallsPass : Pass<"cir-raise-enzyme-calls", "ModuleOp"> {
     plugin reads them, and an argument without one gets the activity the
     plugin would give it: a float is active, a pointer is duplicated, and an
     integer is constant. A float return is seeded with 1.0 in reverse mode.
+    A call to memmove, which ClangIR emits for __builtin_memmove too, is
+    raised to cir.libc.memmove, which has a derivative.
   }];
   let dependentDialects = ["enzyme::EnzymeDialect", ];
 }
